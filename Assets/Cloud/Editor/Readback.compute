@@ -1,0 +1,10 @@
+#pragma kernel CopyScalar
+int3 Size;
+Texture3D<float> Src;
+RWStructuredBuffer<float> Dst;
+[numthreads(8,8,8)]
+void CopyScalar(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)Size)) return;
+    Dst[id.x + Size.x * (id.y + Size.y * id.z)] = Src[id];
+}

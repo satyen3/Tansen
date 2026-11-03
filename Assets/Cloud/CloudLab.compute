@@ -1,0 +1,49 @@
+// CloudLab: writes a static, procedural cumulus into CloudSim's cloud-water field (q_c, kg/kg).
+// Shape: smooth union of spheres (core stack + lobes), clipped to a flat base.
+// Liquid water: rises linearly with height above the base (like adiabatic ascent), times a dilution that is
+// lowest at the edge and reaches coreFraction of the adiabatic value inside, faded in over edgeSoftness.
+#pragma kernel Shape
+
+RWTexture3D<float> QcOut;
+StructuredBuffer<float4> Spheres;   // xyz centre (m, domain coordinates), w radius (m)
+StructuredBuffer<float> AirRho;     // per cell row: air density (kg/m^3), same as CloudSim's background
+int3   Size;
+float  CellSize;
+int    SphereCount;
+float  Smooth;        // m: smooth-union blend distance between spheres
+float  BaseHeight;    // m: flat cloud base
+float  BaseSoftness;  // m: how quickly water appears above the base
+float  LwcGradient;   // g/m^3 per km above the base (adiabatic ~2)
+float  CoreFraction;  // fraction of that reached in the core (entrainment dilution)
+float  EdgeSoftness;  // m: depth over which the water fades in from the surface
+float  LwcMax;        // g/m^3 cap
+
+// polynomial smooth minimum (Quilez): blends surfaces within k
+float SMin(float a, float b, float k)
+{
+    float h = saturate(0.5 + 0.5 * (b - a) / k);
+    return lerp(b, a, h) - k * h * (1 - h);
+}
+
+[numthreads(8, 8, 8)]
+void Shape(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)Size)) return;
+    float3 p = (id + 0.5) * CellSize;
+    float d = 1e9;
+    for (int i = 0; i < SphereCount; i++)
+    {
+        float4 s = Spheres[i];
+        d = SMin(d, length(p - s.xyz) - s.w, Smooth);
+    }
+    float h = p.y - BaseHeight;
+    float depth = min(-d, h);                       // distance inside the shape, the flat base counts as a surface
+    float lwc = 0;
+    if (depth > 0)
+    {
+        float adiabatic = LwcGradient * h / 1000;  // g/m^3
+        float fade = smoothstep(0, EdgeSoftness, -d) * smoothstep(0, BaseSoftness, h);
+        lwc = min(adiabatic * CoreFraction * fade, LwcMax);
+    }
+    QcOut[id] = lwc / 1000 / AirRho[id.y];          // g/m^3 -> kg/kg
+}

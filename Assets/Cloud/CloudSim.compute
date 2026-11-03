@@ -1,0 +1,1426 @@
+// Cloud simulation kernels.
+//
+// Grid layout (staggered "MAC" grid):
+//   - Scalars (density, pressure, divergence) live at cell centers. Cell (i,j,k) spans
+//     [i, i+1] x [j, j+1] x [k, k+1] in grid units, so its center is at (i+0.5, j+0.5, k+0.5).
+//   - Velocity lives on cell faces. Vel[i,j,k].x is u on the +x face of cell (i,j,k), i.e. at
+//     grid position (i+1, j+0.5, k+0.5); .y is v on the +y face, .z is w on the +z face.
+//   - Solid walls: the faces on the domain boundary (position 0 and Size along an axis) carry zero
+//     normal velocity. Face index -1 is the low wall, face index Size-1 the high wall.
+//   - Periodic axes (x and z when Periodic = 1): index -1 is the same face as index Size-1, and every
+//     lookup wraps around. y (floor and ceiling) is always a solid free-slip wall.
+// This layout makes divergence, the pressure Laplacian and the gradient one consistent set of
+// operators, so a converged pressure solve gives exactly zero discrete divergence.
+// Units: meters, seconds. x, z horizontal, y up.
+
+#pragma kernel InitDensity
+#pragma kernel InitVelocity
+#pragma kernel InitTheta
+#pragma kernel InitMoisture
+#pragma kernel Buoyancy
+#pragma kernel SaturationAdjust
+#pragma kernel SumField
+#pragma kernel ReduceTotals
+#pragma kernel ScaleFields
+#pragma kernel MakeExtinction
+#pragma kernel SurfaceForcing
+#pragma kernel RowMeans
+#pragma kernel WindForcing
+#pragma kernel AdvectScalar
+#pragma kernel MacCormackCorrect
+#pragma kernel AdvectScalars4
+#pragma kernel MacCormack4
+#pragma kernel AdvectVelocity
+#pragma kernel Divergence
+#pragma kernel Jacobi
+#pragma kernel RedBlackSOR
+#pragma kernel Subtract
+#pragma kernel MGSmooth
+#pragma kernel MGResidual
+#pragma kernel MGRestrict
+#pragma kernel MGProlong
+#pragma kernel MGClear
+#pragma kernel GenerateNoise
+#pragma kernel ClearScalar
+#pragma kernel MakeView
+#pragma kernel Stats
+
+int3  Size;          // cells per axis
+int3  Groups;        // thread groups per axis (used by Stats to index its output)
+int   Periodic;      // 1: x and z wrap around (periodic); 0: all six walls solid
+float cellSize;      // m
+float dt;            // s
+
+// initial conditions
+float  swirl;        // rad/s around the vertical axis through the domain center
+float3 uniformWind;  // m/s
+float  expansion;    // m/s, peak outward speed of the radial burst
+float  burstSigma;   // m, Gaussian width of the burst
+float4 Blob1;        // xyz = center as a fraction of the domain (0..1), w = radius in m
+float4 Blob2;
+int    BubbleOn;     // 1: warm-bubble scenario (density marks the bubble air, theta gets the bump)
+float4 Bubble;       // xyz = center in m from the domain corner, w = radius in m
+float  bubbleDTheta; // K, potential temperature excess at the bubble center
+
+// thermodynamics (Boussinesq)
+float  gravity;      // m/s^2
+// Background state per cell row y: (theta_bg K, q_v_bg kg/kg, hydrostatic pressure Pa, air density kg/m^3)
+StructuredBuffer<float4> Bg;
+
+// Background wind per cell row y: (u along x, v along z, 0, 0) in m/s
+StructuredBuffer<float4> BgWind;
+RWStructuredBuffer<float4> RowMean;   // per row: (mean u, mean v, 0, 0) of the current wind
+int    SoundingWind;                  // 1: add BgWind to the initial wind
+
+// Stage F forcing
+float  sensibleFlux;   // W/m^2 into the lowest cell row
+float  latentFlux;     // W/m^2 (evaporation into the lowest cell row)
+float  patchAmp;       // 0..1, relative variation of the surface fluxes
+float4 PatchK[4];      // per term: (waves along x, waves along z, phase x, phase z)
+float4 PatchW;         // per term weight, sum of |w| = 1 -> pattern in [1 - patchAmp, 1 + patchAmp], mean exactly 1
+int    NudgeOn;  float nudgeRate;     // 1/s, relaxation of the row-mean wind toward BgWind
+int    SpongeOn; float spongeBottom;  // m
+float  spongeRate;                    // 1/s at the top
+int    PerturbOn; float perturbAmp; float perturbDepth; uint perturbSeed;
+
+// moisture
+float  bubbleRH;     // relative humidity inside the bubble (0 = just the background vapor)
+int    SatIterations;
+float  extinctionPerKg; // m^2 per kg of cloud water: sigma = k * rho_air * q_c
+
+static const float Rd = 287.0, Rv = 461.5, Cp = 1004.0, Lv = 2.5e6, P0 = 1.0e5;
+static const float Kappa = Rd / Cp;
+
+float Exner(float p)         { return pow(max(p / P0, 1e-6), Kappa); }                     // T = theta * Exner
+float SatVaporPressure(float T)                                                  // Pa, Bolton/Tetens
+{
+    float Tc = T - 273.15;
+    return 611.2 * exp(17.67 * Tc / (Tc + 243.5));
+}
+float SatMixingRatio(float T, float p)                                           // kg/kg
+{
+    float e = SatVaporPressure(T);
+    return 0.622 * e / max(p - e, 1.0);
+}
+
+// pressure solver
+int   Parity;        // 0 or 1: which color of the red-black checkerboard to update
+float Omega;         // over-relaxation factor (1 = Gauss-Seidel)
+int   LimiterRevert;  // MacCormack limiter: 0 = clamp to neighbor min/max, 1 = fall back to the plain result
+
+// view
+int   ViewMode;      // 0 density, 1 pressure (Pa), 2 divergence*dt, 3 speed (m/s), 4 vertical velocity (m/s),
+                     // 5 theta' (K), 6 q_v (g/kg), 7 q_c (g/kg), 8 saturation ratio q_v/q_s
+float rhoAir;        // kg/m^3, only used to convert the pressure potential to Pa for display
+
+Texture3D<float4>   VelIn;
+RWTexture3D<float4> VelOut;
+Texture3D<float>    ScalarIn;
+Texture3D<float>    ScalarHat;   // MacCormack: the plain semi-Lagrangian result for this step
+// The four advected scalars (density, theta, q_v, q_c) moved together, sharing one trace per cell
+Texture3D<float>    S0In, S1In, S2In, S3In;
+Texture3D<float>    H0, H1, H2, H3;         // MacCormack: plain semi-Lagrangian results
+RWTexture3D<float>  S0Out, S1Out, S2Out, S3Out;
+RWTexture3D<float>  ScalarOut;
+Texture3D<float>    PressureIn;
+RWTexture3D<float>  PressureOut;
+RWTexture3D<float>  PressureRW;
+Texture3D<float>    DivIn;
+RWTexture3D<float>  DivOut;
+Texture3D<float>    ThetaIn;     // potential temperature (K)
+Texture3D<float>    QvIn;        // water vapor mixing ratio (kg/kg)
+Texture3D<float>    QcIn;        // cloud water mixing ratio (kg/kg)
+RWTexture3D<float>  ThetaRW;
+RWTexture3D<float>  QvRW;
+RWTexture3D<float>  QcRW;
+RWTexture3D<float>  FieldRW;
+RWTexture3D<float>  FieldRW2;
+Texture3D<float>    ScalarIn2;
+int   UseB;           // SumField / ScaleFields: also use the second field
+int   Slot;           // SumField / ReduceTotals: which total to compute
+int   SlotBefore;     // ScaleFields: total before advection (the one after is SlotBefore + 1)
+int   NGroups;        // number of thread groups of a full-grid dispatch
+RWStructuredBuffer<float> Partials;
+RWStructuredBuffer<float> Totals;
+Texture3D<float>    ViewIn;
+RWTexture3D<float>  ViewOut;
+RWStructuredBuffer<float4> StatsOut;
+
+static const int3 DX = int3(1, 0, 0);
+static const int3 DY = int3(0, 1, 0);
+static const int3 DZ = int3(0, 0, 1);
+
+bool Outside(uint3 id) { return any(id >= (uint3)Size); }
+bool PeriodicAxis(int a) { return Periodic != 0 && a != 1; }
+
+// Wrap an index that is at most one period outside [0, n). Avoids integer modulo, which is very
+// slow on GPUs and was called hundreds of times per cell per step.
+int WrapIndex(int i, int n) { return i < 0 ? i + n : (i >= n ? i - n : i); }
+
+// Map a cell index (at most one period outside the domain) into the domain: wrap along periodic
+// axes, clamp along solid ones.
+// (Single return statement in these helpers: early returns make the Metal compiler emit
+// "potentially uninitialized variable" warnings.)
+int3 Cell(int3 c)
+{
+    int3 m = clamp(c, int3(0, 0, 0), Size - 1);
+    if (Periodic != 0) { m.x = WrapIndex(c.x, Size.x); m.z = WrapIndex(c.z, Size.z); }
+    return m;
+}
+
+// Bring a grid position back into [0, Size) along periodic axes, so the indices derived from it
+// stay within the range Cell() can wrap.
+float3 WrapPos(float3 x)
+{
+    if (Periodic != 0)
+    {
+        x.x -= Size.x * floor(x.x / Size.x);
+        x.z -= Size.z * floor(x.z / Size.z);
+    }
+    return x;
+}
+
+// Is the neighbor index c inside the domain (or reachable by wrapping)?
+bool HasCell(int3 c)
+{
+    bool inY = c.y >= 0 && c.y < Size.y;
+    bool inXZ = Periodic != 0 || (c.x >= 0 && c.x < Size.x && c.z >= 0 && c.z < Size.z);
+    return inY && inXZ;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Boundary-aware lookups
+// ---------------------------------------------------------------------------------------------
+
+// Normal velocity on face index c along axis a. Faces on a solid boundary are 0. Along solid
+// tangential axes the index is clamped (free slip, zero gradient); periodic axes wrap.
+float FaceVel(int3 c, int a)
+{
+    int ca = a == 0 ? c.x : (a == 1 ? c.y : c.z);
+    int na = a == 0 ? Size.x : (a == 1 ? Size.y : Size.z);
+    bool wall = !PeriodicAxis(a) && (ca < 0 || ca >= na - 1);
+    float4 v = VelIn[Cell(c)];
+    float u = a == 0 ? v.x : (a == 1 ? v.y : v.z);
+    return wall ? 0 : u;
+}
+
+bool IsWallFace(int3 c, int a) { return !PeriodicAxis(a) && c[a] >= Size[a] - 1; }
+
+// Trilinear sample of velocity component a at grid position x (grid units).
+float SampleFace(float3 x, int a)
+{
+    // component a is stored one half cell further along a
+    float3 off = float3(a == 0 ? 1.0 : 0.5, a == 1 ? 1.0 : 0.5, a == 2 ? 1.0 : 0.5);
+    float3 f = WrapPos(x) - off;
+    float3 fl = floor(f);
+    float3 w = f - fl;
+    int3 i = (int3)fl;
+    float c000 = FaceVel(i,              a), c100 = FaceVel(i + DX,           a);
+    float c010 = FaceVel(i + DY,         a), c110 = FaceVel(i + DX + DY,      a);
+    float c001 = FaceVel(i + DZ,         a), c101 = FaceVel(i + DX + DZ,      a);
+    float c011 = FaceVel(i + DY + DZ,    a), c111 = FaceVel(i + DX + DY + DZ, a);
+    float c00 = lerp(c000, c100, w.x), c10 = lerp(c010, c110, w.x);
+    float c01 = lerp(c001, c101, w.x), c11 = lerp(c011, c111, w.x);
+    return lerp(lerp(c00, c10, w.y), lerp(c01, c11, w.y), w.z);
+}
+
+float3 VelAt(float3 x) { return float3(SampleFace(x, 0), SampleFace(x, 1), SampleFace(x, 2)); }
+
+// Velocity at the center of cell c (average of its two faces per axis).
+float3 CellVel(int3 c)
+{
+    return 0.5 * float3(FaceVel(c, 0) + FaceVel(c - DX, 0),
+                        FaceVel(c, 1) + FaceVel(c - DY, 1),
+                        FaceVel(c, 2) + FaceVel(c - DZ, 2));
+}
+
+// The 8 cells around grid position x that trilinear interpolation of a cell-centered scalar
+// uses: low corner i, high corner j, weights w. Clamp-to-edge along solid axes, wrap along
+// periodic ones (done by hand: one hardware sampler can't do both).
+void Corners(float3 x, out int3 i, out int3 j, out float3 w)
+{
+    float3 f = WrapPos(x) - 0.5;
+    if (Periodic != 0) f.y = clamp(f.y, 0, Size.y - 1);
+    else               f = clamp(f, float3(0, 0, 0), (float3)(Size - 1));
+    float3 fl = floor(f);
+    w = f - fl;
+    i = Cell((int3)fl);
+    j = Cell((int3)fl + 1);
+}
+
+float SampleScalar(Texture3D<float> t, float3 x)
+{
+    int3 i, j; float3 w;
+    Corners(x, i, j, w);
+    float c000 = t[int3(i.x, i.y, i.z)], c100 = t[int3(j.x, i.y, i.z)];
+    float c010 = t[int3(i.x, j.y, i.z)], c110 = t[int3(j.x, j.y, i.z)];
+    float c001 = t[int3(i.x, i.y, j.z)], c101 = t[int3(j.x, i.y, j.z)];
+    float c011 = t[int3(i.x, j.y, j.z)], c111 = t[int3(j.x, j.y, j.z)];
+    float c00 = lerp(c000, c100, w.x), c10 = lerp(c010, c110, w.x);
+    float c01 = lerp(c001, c101, w.x), c11 = lerp(c011, c111, w.x);
+    return lerp(lerp(c00, c10, w.y), lerp(c01, c11, w.y), w.z);
+}
+
+// Trilinear blend / min / max of the 8 cells found by Corners().
+float Trilerp8(Texture3D<float> t, int3 i, int3 j, float3 w)
+{
+    float c000 = t[int3(i.x, i.y, i.z)], c100 = t[int3(j.x, i.y, i.z)];
+    float c010 = t[int3(i.x, j.y, i.z)], c110 = t[int3(j.x, j.y, i.z)];
+    float c001 = t[int3(i.x, i.y, j.z)], c101 = t[int3(j.x, i.y, j.z)];
+    float c011 = t[int3(i.x, j.y, j.z)], c111 = t[int3(j.x, j.y, j.z)];
+    float c00 = lerp(c000, c100, w.x), c10 = lerp(c010, c110, w.x);
+    float c01 = lerp(c001, c101, w.x), c11 = lerp(c011, c111, w.x);
+    return lerp(lerp(c00, c10, w.y), lerp(c01, c11, w.y), w.z);
+}
+
+float2 MinMax8(Texture3D<float> t, int3 i, int3 j)
+{
+    float c000 = t[int3(i.x, i.y, i.z)], c100 = t[int3(j.x, i.y, i.z)];
+    float c010 = t[int3(i.x, j.y, i.z)], c110 = t[int3(j.x, j.y, i.z)];
+    float c001 = t[int3(i.x, i.y, j.z)], c101 = t[int3(j.x, i.y, j.z)];
+    float c011 = t[int3(i.x, j.y, j.z)], c111 = t[int3(j.x, j.y, j.z)];
+    float lo = min(min(min(c000, c100), min(c010, c110)), min(min(c001, c101), min(c011, c111)));
+    float hi = max(max(max(c000, c100), max(c010, c110)), max(max(c001, c101), max(c011, c111)));
+    return float2(lo, hi);
+}
+
+// Smallest and largest of the 8 values SampleScalar(t, x) interpolates between.
+float2 MinMaxScalar(Texture3D<float> t, float3 x)
+{
+    int3 i, j; float3 w;
+    Corners(x, i, j, w);
+    float c000 = t[int3(i.x, i.y, i.z)], c100 = t[int3(j.x, i.y, i.z)];
+    float c010 = t[int3(i.x, j.y, i.z)], c110 = t[int3(j.x, j.y, i.z)];
+    float c001 = t[int3(i.x, i.y, j.z)], c101 = t[int3(j.x, i.y, j.z)];
+    float c011 = t[int3(i.x, j.y, j.z)], c111 = t[int3(j.x, j.y, j.z)];
+    float lo = min(min(min(c000, c100), min(c010, c110)), min(min(c001, c101), min(c011, c111)));
+    float hi = max(max(max(c000, c100), max(c010, c110)), max(max(c001, c101), max(c011, c111)));
+    return float2(lo, hi);
+}
+
+// Second-order (midpoint) backtrace: where did the fluid now at x come from one step ago?
+float3 Backtrace(float3 x)
+{
+    float k = dt / cellSize;
+    float3 mid = x - 0.5 * k * VelAt(x);
+    return x - k * VelAt(mid);
+}
+
+// The same trace run forward in time (used by MacCormack to go back from the new state).
+float3 Forwardtrace(float3 x)
+{
+    float k = dt / cellSize;
+    float3 mid = x + 0.5 * k * VelAt(x);
+    return x + k * VelAt(mid);
+}
+
+float Div(int3 c)
+{
+    return (FaceVel(c, 0) - FaceVel(c - DX, 0)
+          + FaceVel(c, 1) - FaceVel(c - DY, 1)
+          + FaceVel(c, 2) - FaceVel(c - DZ, 2)) / cellSize;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Initial conditions
+// ---------------------------------------------------------------------------------------------
+
+float3 DomainMeters() { return (float3)Size * cellSize; }
+
+// Position (m) of grid point x relative to the domain center.
+float3 Meters(float3 x) { return (x - 0.5 * (float3)Size) * cellSize; }
+
+// Smooth bubble shape: 1 at the center, cos^2 falloff to 0 at the radius.
+float BubbleShape(uint3 id)
+{
+    float r = length((id + 0.5) * cellSize - Bubble.xyz) / Bubble.w;
+    float c = cos(1.5707963 * saturate(r));
+    return r < 1 ? c * c : 0;
+}
+
+[numthreads(8, 8, 8)]
+void InitDensity(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    if (BubbleOn != 0) { ScalarOut[id] = BubbleShape(id); return; }   // tracer marking the bubble air
+    float3 p = (id + 0.5) * cellSize;                         // m from the domain corner
+    float b1 = saturate(1.0 - length(p - Blob1.xyz * DomainMeters()) / Blob1.w);
+    float b2 = saturate(1.0 - length(p - Blob2.xyz * DomainMeters()) / Blob2.w);
+    ScalarOut[id] = max(b1, b2);
+}
+
+float3 AnalyticWind(float3 x)
+{
+    float3 r = Meters(x);
+    float3 v = float3(-r.z, 0, r.x) * swirl + uniformWind;
+    float3 d = r - Meters(Blob1.xyz * (float3)Size);         // from the first blob's center
+    float g = exp(-dot(d, d) / (2 * burstSigma * burstSigma));
+    v += expansion * g * d / sqrt(dot(d, d) + 1.0);           // radial burst: purely divergent
+    return v;
+}
+
+[numthreads(8, 8, 8)]
+void InitVelocity(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float3 c = id + 0.5;
+    float3 v;
+    v.x = AnalyticWind(c + float3(0.5, 0, 0)).x;              // evaluate each component on its face
+    v.y = AnalyticWind(c + float3(0, 0.5, 0)).y;
+    v.z = AnalyticWind(c + float3(0, 0, 0.5)).z;
+    if (SoundingWind != 0) { v.x += BgWind[id.y].x; v.z += BgWind[id.y].y; }
+    [unroll] for (int a = 0; a < 3; a++)
+        if (IsWallFace(id, a)) v[a] = 0;                      // solid wall faces
+    VelOut[id] = float4(v, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Advection (semi-Lagrangian, midpoint backtrace, trilinear interpolation)
+// ---------------------------------------------------------------------------------------------
+
+// Integer hash -> [0, 1). Deterministic per cell and seed.
+float Hash01(uint3 p, uint seed)
+{
+    uint h = p.x * 73856093u ^ p.y * 19349663u ^ p.z * 83492791u ^ seed * 2654435761u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    return (h & 0xFFFFFFu) / 16777216.0;
+}
+
+[numthreads(8, 8, 8)]
+void InitTheta(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float th = Bg[id.y].x;
+    if (BubbleOn != 0) th += bubbleDTheta * BubbleShape(id);
+    if (PerturbOn != 0 && (id.y + 0.5) * cellSize < perturbDepth)
+        th += perturbAmp * (2 * Hash01(id, perturbSeed) - 1);   // random kick to trigger convection
+    ScalarOut[id] = th;
+}
+
+// Surface fluxes into the lowest cell row: d(theta)/dt = H / (rho cp dz Pi), dq_v/dt = LE / (rho L dz),
+// times a smooth pattern with mean exactly 1 (sums of sine products with whole wave numbers).
+[numthreads(8, 1, 8)]
+void SurfaceForcing(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)Size.x || id.z >= (uint)Size.z) return;
+    uint3 c = uint3(id.x, 0, id.z);
+    float2 xz = (float2(id.x, id.z) + 0.5) / float2(Size.x, Size.z) * 6.2831853;
+    float pat = 0;
+    [unroll] for (int k = 0; k < 4; k++)
+        pat += PatchW[k] * sin(PatchK[k].x * xz.x + PatchK[k].z) * sin(PatchK[k].y * xz.y + PatchK[k].w);
+    float f = 1 + patchAmp * pat;
+    float4 bg = Bg[0];
+    ThetaRW[c] = ThetaRW[c] + dt * f * sensibleFlux / (bg.w * Cp * cellSize * Exner(bg.z));
+    QvRW[c]    = QvRW[c]    + dt * f * latentFlux   / (bg.w * Lv * cellSize);
+}
+
+// Horizontal mean of u and v (the x and z face velocities) for every cell row. One group per row.
+groupshared float2 gsM[256];
+
+[numthreads(256, 1, 1)]
+void RowMeans(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    uint y = gid.x;
+    uint sx = (uint)Size.x, n = (uint)(Size.x * Size.z);
+    float2 sum = 0;
+    for (uint k = gi; k < n; k += 256)
+    {
+        float4 v = VelIn[uint3(k % sx, y, k / sx)];
+        sum += v.xz;
+    }
+    gsM[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1)
+    {
+        if (gi < s) gsM[gi] += gsM[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) RowMean[y] = float4(gsM[0] / n, 0, 0);
+}
+
+float SpongeCoeff(float z)
+{
+    float top = Size.y * cellSize;
+    float s = saturate((z - spongeBottom) / max(top - spongeBottom, 1));
+    float w = sin(1.5707963 * s);
+    return z > spongeBottom ? spongeRate * w * w : 0;
+}
+
+// (1) Relax the row-mean horizontal wind toward the sounding (shifts a whole row uniformly, so it
+// doesn't damp the eddies). (2) Sponge near the top: damp w and the deviation from the sounding wind,
+// implicitly so it is stable for any rate.
+[numthreads(8, 8, 8)]
+void WindForcing(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float4 v = VelIn[id];
+    float4 bw = BgWind[id.y];
+    if (NudgeOn != 0)
+    {
+        float4 m = RowMean[id.y];
+        v.x += dt * nudgeRate * (bw.x - m.x);
+        v.z += dt * nudgeRate * (bw.y - m.y);
+    }
+    if (SpongeOn != 0)
+    {
+        float ac = SpongeCoeff((id.y + 0.5) * cellSize);    // u, v live at the cell-center height
+        float af = SpongeCoeff((id.y + 1.0) * cellSize);    // w lives on the face above
+        v.x = bw.x + (v.x - bw.x) / (1 + dt * ac);
+        v.z = bw.y + (v.z - bw.y) / (1 + dt * ac);
+        v.y = v.y / (1 + dt * af);
+    }
+    VelOut[id] = v;
+}
+
+// Vapor = background; inside the bubble raised toward bubbleRH (never lowered). No cloud water yet:
+// the saturation adjustment run right after creates it where the air is supersaturated.
+[numthreads(8, 8, 8)]
+void InitMoisture(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float4 bg = Bg[id.y];
+    float qv = bg.y;
+    if (BubbleOn != 0)
+    {
+        float shape = BubbleShape(id);
+        float T = (bg.x + bubbleDTheta * shape) * Exner(bg.z);
+        qv += shape * max(bubbleRH * SatMixingRatio(T, bg.z) - bg.y, 0);
+    }
+    QvRW[id] = qv;
+    QcRW[id] = 0;
+}
+
+// Boussinesq buoyancy on the vertical faces, virtual-temperature form:
+//   dw/dt = g [ (theta - theta_bg)/theta_bg + 0.61 (q_v - q_v_bg) - q_c ]
+// with each field averaged from the two cells the face separates. Floor/ceiling faces stay 0.
+[numthreads(8, 8, 8)]
+void Buoyancy(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float4 v = VelIn[id];
+    if (!IsWallFace(id, 1))
+    {
+        int3 up = id + DY;
+        float4 bg = 0.5 * (Bg[id.y] + Bg[id.y + 1]);
+        float th = 0.5 * (ThetaIn[id] + ThetaIn[up]);
+        float qv = 0.5 * (QvIn[id] + QvIn[up]);
+        float qc = 0.5 * (QcIn[id] + QcIn[up]);
+        v.y += dt * gravity * ((th - bg.x) / bg.x + 0.61 * (qv - bg.y) - qc);
+    }
+    VelOut[id] = v;
+}
+
+// Saturation adjustment: condense vapor above saturation into cloud water (warming the air by the
+// latent heat), or evaporate cloud water into subsaturated air (cooling it). Newton iterations
+// include the latent-heat feedback on q_s. q_v + q_c is unchanged by construction.
+[numthreads(8, 8, 8)]
+void SaturationAdjust(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float4 bg = Bg[id.y];
+    float p = bg.z, ex = Exner(p);
+    float th = ThetaRW[id], qv = QvRW[id], qc = QcRW[id];
+    for (int it = 0; it < SatIterations; it++)
+    {
+        float T = th * ex;
+        float qs = SatMixingRatio(T, p);
+        float dq = (qv - qs) / (1.0 + Lv * Lv * qs / (Cp * Rv * T * T));
+        dq = max(dq, -qc);                       // can't evaporate more cloud than there is
+        qv -= dq;
+        qc += dq;
+        th += Lv / (Cp * ex) * dq;               // d(theta) = L/(cp Pi) dq
+    }
+    ThetaRW[id] = th;
+    QvRW[id] = qv;
+    QcRW[id] = max(qc, 0);
+}
+
+// --- global mass fixer: total before advection, total after, rescale -------------------------
+// Totals are mass-weighted (sum of rho_air(y) * field over the cells).
+
+groupshared float gsSum[512];
+
+[numthreads(8, 8, 8)]
+void SumField(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    float v = 0;
+    if (!Outside(id)) v = Bg[id.y].w * (ScalarIn[id] + (UseB != 0 ? ScalarIn2[id] : 0));
+    gsSum[gi] = v;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 256; s > 0; s >>= 1)
+    {
+        if (gi < s) gsSum[gi] += gsSum[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) Partials[Slot * NGroups + gid.x + Groups.x * (gid.y + Groups.y * gid.z)] = gsSum[0];
+}
+
+groupshared float gsR[256];
+
+[numthreads(256, 1, 1)]
+void ReduceTotals(uint gi : SV_GroupIndex)
+{
+    float sum = 0, comp = 0;                      // Kahan summation
+    for (int g = gi; g < NGroups; g += 256)
+    {
+        float y = Partials[Slot * NGroups + g] - comp;
+        float t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
+    }
+    gsR[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1)
+    {
+        if (gi < s) gsR[gi] += gsR[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) Totals[Slot] = gsR[0];
+}
+
+[numthreads(8, 8, 8)]
+void ScaleFields(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float before = Totals[SlotBefore], after = Totals[SlotBefore + 1];
+    float f = after > 0 ? before / after : 1.0;
+    FieldRW[id] = FieldRW[id] * f;
+    if (UseB != 0) FieldRW2[id] = FieldRW2[id] * f;
+}
+
+// Extinction coefficient (1/m) for the renderer: sigma = k * rho_air * q_c.
+[numthreads(8, 8, 8)]
+void MakeExtinction(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    ViewOut[id] = extinctionPerKg * Bg[id.y].w * QcIn[id];
+}
+
+[numthreads(8, 8, 8)]
+void AdvectScalar(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    ScalarOut[id] = SampleScalar(ScalarIn, Backtrace(id + 0.5));
+}
+
+// MacCormack (Selle et al. 2008). ScalarHat = plain semi-Lagrangian result. Advecting it backward
+// in time should give back the old field; half of the difference is the error estimate we add back.
+// The result is clamped to the min/max of the cells the backtrace touched, so it can't overshoot
+// (no new extremes, no negative density).
+[numthreads(8, 8, 8)]
+void MacCormackCorrect(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float3 x = id + 0.5;
+    float hat = ScalarHat[id];
+    float back = SampleScalar(ScalarHat, Forwardtrace(x));
+    float r = hat + 0.5 * (ScalarIn[id] - back);
+    float2 mm = MinMaxScalar(ScalarIn, Backtrace(x));
+    if (LimiterRevert != 0) ScalarOut[id] = (r < mm.x || r > mm.y) ? hat : r;
+    else                    ScalarOut[id] = clamp(r, mm.x, mm.y);
+}
+
+// Same as AdvectScalar / MacCormackCorrect, but for all four scalars at once: the backtrace (and the
+// forward trace) is computed once per cell instead of once per field. Results are identical.
+[numthreads(8, 8, 8)]
+void AdvectScalars4(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    int3 i, j; float3 w;
+    Corners(Backtrace(id + 0.5), i, j, w);
+    S0Out[id] = Trilerp8(S0In, i, j, w);
+    S1Out[id] = Trilerp8(S1In, i, j, w);
+    S2Out[id] = Trilerp8(S2In, i, j, w);
+    S3Out[id] = Trilerp8(S3In, i, j, w);
+}
+
+float Limit(float hat, float r, float2 mm)
+{
+    return LimiterRevert != 0 ? ((r < mm.x || r > mm.y) ? hat : r) : clamp(r, mm.x, mm.y);
+}
+
+float MacCormack1(Texture3D<float> old, Texture3D<float> hatT, uint3 id, int3 fi, int3 fj, float3 fw, int3 bi, int3 bj)
+{
+    float hat = hatT[id];
+    float r = hat + 0.5 * (old[id] - Trilerp8(hatT, fi, fj, fw));
+    return Limit(hat, r, MinMax8(old, bi, bj));
+}
+
+[numthreads(8, 8, 8)]
+void MacCormack4(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float3 x = id + 0.5;
+    int3 bi, bj, fi, fj; float3 bw, fw;
+    Corners(Backtrace(x), bi, bj, bw);
+    Corners(Forwardtrace(x), fi, fj, fw);
+    S0Out[id] = MacCormack1(S0In, H0, id, fi, fj, fw, bi, bj);
+    S1Out[id] = MacCormack1(S1In, H1, id, fi, fj, fw, bi, bj);
+    S2Out[id] = MacCormack1(S2In, H2, id, fi, fj, fw, bi, bj);
+    S3Out[id] = MacCormack1(S3In, H3, id, fi, fj, fw, bi, bj);
+}
+
+[numthreads(8, 8, 8)]
+void AdvectVelocity(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float3 c = id + 0.5;
+    float3 v;
+    v.x = SampleFace(Backtrace(c + float3(0.5, 0, 0)), 0);
+    v.y = SampleFace(Backtrace(c + float3(0, 0.5, 0)), 1);
+    v.z = SampleFace(Backtrace(c + float3(0, 0, 0.5)), 2);
+    [unroll] for (int a = 0; a < 3; a++)
+        if (IsWallFace(id, a)) v[a] = 0;
+    VelOut[id] = float4(v, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pressure projection. We solve  Laplacian(P) = div(u)  and then set  u -= grad(P).
+// P is a "pressure potential" in m^2/s; the physical pressure is rho * P / dt (Pa).
+// Solid walls: zero normal velocity, which means zero normal pressure gradient (Neumann): a neighbor
+// outside the domain is simply left out of the Laplacian. Periodic axes: the neighbor wraps.
+// Red-black ordering needs even nx and nz when periodic (CloudSim enforces it).
+// ---------------------------------------------------------------------------------------------
+
+[numthreads(8, 8, 8)]
+void Divergence(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    DivOut[id] = Div(id);
+}
+
+float NeighborSum(Texture3D<float> p, int3 c, out float n)
+{
+    float s = 0; n = 0;
+    if (HasCell(c - DX)) { s += p[Cell(c - DX)]; n += 1; }
+    if (HasCell(c + DX)) { s += p[Cell(c + DX)]; n += 1; }
+    if (HasCell(c - DY)) { s += p[Cell(c - DY)]; n += 1; }
+    if (HasCell(c + DY)) { s += p[Cell(c + DY)]; n += 1; }
+    if (HasCell(c - DZ)) { s += p[Cell(c - DZ)]; n += 1; }
+    if (HasCell(c + DZ)) { s += p[Cell(c + DZ)]; n += 1; }
+    return s;
+}
+
+[numthreads(8, 8, 8)]
+void Jacobi(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float n;
+    float s = NeighborSum(PressureIn, id, n);
+    PressureOut[id] = (s - cellSize * cellSize * DivIn[id]) / n;
+}
+
+// In-place red-black Gauss-Seidel with over-relaxation. Each dispatch updates one color; all
+// neighbors of a cell have the other color, so there is no read/write race.
+[numthreads(8, 8, 8)]
+void RedBlackSOR(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    if (((id.x + id.y + id.z) & 1) != (uint)Parity) return;
+    int3 c = id;
+    float s = 0, n = 0;
+    if (HasCell(c - DX)) { s += PressureRW[Cell(c - DX)]; n += 1; }
+    if (HasCell(c + DX)) { s += PressureRW[Cell(c + DX)]; n += 1; }
+    if (HasCell(c - DY)) { s += PressureRW[Cell(c - DY)]; n += 1; }
+    if (HasCell(c + DY)) { s += PressureRW[Cell(c + DY)]; n += 1; }
+    if (HasCell(c - DZ)) { s += PressureRW[Cell(c - DZ)]; n += 1; }
+    if (HasCell(c + DZ)) { s += PressureRW[Cell(c + DZ)]; n += 1; }
+    float gs = (s - cellSize * cellSize * DivIn[id]) / n;
+    PressureRW[id] = lerp(PressureRW[id], gs, Omega);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Multigrid (V-cycle) for the same pressure equation. Each level has half the cells per axis of the
+// one above (cell size doubled). Same boundary rules on every level: periodic x/z (if enabled),
+// Neumann (neighbor left out) at solid walls.
+//   MGSmooth   : red-black Gauss-Seidel/SOR sweep on MgP with right-hand side MgB
+//   MGResidual : MgROut = MgB - Laplacian(MgPIn)
+//   MGRestrict : coarse MgCoarseOut = average of the 8 fine cells of MgFineIn
+//   MGProlong  : fine MgP += trilinear interpolation of coarse MgCoarseIn
+// ---------------------------------------------------------------------------------------------
+
+int3  LSize;        // cells of the level being processed
+int3  CSize;        // cells of the next coarser level (MGProlong)
+float LH;           // cell size of the level (m)
+RWTexture3D<float> MgP;
+Texture3D<float>   MgPIn;
+Texture3D<float>   MgB;
+RWTexture3D<float> MgROut;
+Texture3D<float>   MgFineIn;
+RWTexture3D<float> MgCoarseOut;
+Texture3D<float>   MgCoarseIn;
+
+int3 LCell(int3 c, int3 n)
+{
+    int3 m = clamp(c, int3(0, 0, 0), n - 1);
+    if (Periodic != 0) { m.x = WrapIndex(c.x, n.x); m.z = WrapIndex(c.z, n.z); }
+    return m;
+}
+
+bool LHas(int3 c, int3 n)
+{
+    bool inY = c.y >= 0 && c.y < n.y;
+    bool inXZ = Periodic != 0 || (c.x >= 0 && c.x < n.x && c.z >= 0 && c.z < n.z);
+    return inY && inXZ;
+}
+
+[numthreads(8, 8, 8)]
+void MGSmooth(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)LSize)) return;
+    if (((id.x + id.y + id.z) & 1) != (uint)Parity) return;
+    int3 c = id;
+    float s = 0, n = 0;
+    int3 nb[6] = { c - DX, c + DX, c - DY, c + DY, c - DZ, c + DZ };
+    [unroll] for (int k = 0; k < 6; k++)
+        if (LHas(nb[k], LSize)) { s += MgP[LCell(nb[k], LSize)]; n += 1; }
+    float gs = (s - LH * LH * MgB[id]) / n;
+    MgP[id] = lerp(MgP[id], gs, Omega);
+}
+
+[numthreads(8, 8, 8)]
+void MGResidual(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)LSize)) return;
+    int3 c = id;
+    float s = 0, n = 0;
+    int3 nb[6] = { c - DX, c + DX, c - DY, c + DY, c - DZ, c + DZ };
+    [unroll] for (int k = 0; k < 6; k++)
+        if (LHas(nb[k], LSize)) { s += MgPIn[LCell(nb[k], LSize)]; n += 1; }
+    MgROut[id] = MgB[id] - (s - n * MgPIn[id]) / (LH * LH);
+}
+
+[numthreads(8, 8, 8)]
+void MGRestrict(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)LSize)) return;          // LSize = coarse level here
+    int3 f = 2 * (int3)id;
+    float sum = 0;
+    [unroll] for (int k = 0; k < 8; k++)
+        sum += MgFineIn[f + int3(k & 1, (k >> 1) & 1, k >> 2)];
+    MgCoarseOut[id] = sum * 0.125;
+}
+
+[numthreads(8, 8, 8)]
+void MGProlong(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)LSize)) return;          // LSize = fine level, CSize = coarse level
+    float3 xc = (id + 0.5) * 0.5 - 0.5;           // position in coarse cell-index space
+    int3 i0 = (int3)floor(xc);
+    float3 w = xc - i0;
+    float sum = 0;
+    [unroll] for (int k = 0; k < 8; k++)
+    {
+        int3 d = int3(k & 1, (k >> 1) & 1, k >> 2);
+        float wt = (d.x ? w.x : 1 - w.x) * (d.y ? w.y : 1 - w.y) * (d.z ? w.z : 1 - w.z);
+        sum += wt * MgCoarseIn[LCell(i0 + d, CSize)];
+    }
+    MgP[id] = MgP[id] + sum;
+}
+
+[numthreads(8, 8, 8)]
+void MGClear(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)LSize)) return;
+    MgP[id] = 0;
+}
+
+[numthreads(8, 8, 8)]
+void Subtract(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    int3 c = id;
+    float3 v = VelIn[id].xyz;
+    float p = PressureIn[id];
+    v.x = IsWallFace(c, 0) ? 0 : v.x - (PressureIn[Cell(c + DX)] - p) / cellSize;
+    v.y = IsWallFace(c, 1) ? 0 : v.y - (PressureIn[Cell(c + DY)] - p) / cellSize;
+    v.z = IsWallFace(c, 2) ? 0 : v.z - (PressureIn[Cell(c + DZ)] - p) / cellSize;
+    VelOut[id] = float4(v, 0);
+}
+
+[numthreads(8, 8, 8)]
+void ClearScalar(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    ScalarOut[id] = 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Debug view: writes the field selected by ViewMode (in physical units) into ViewOut.
+// Needs VelIn, ScalarIn (density), PressureIn, ThetaIn, QvIn, QcIn and Bg bound.
+// ---------------------------------------------------------------------------------------------
+
+[numthreads(8, 8, 8)]
+void MakeView(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    float r;
+    if (ViewMode == 0)      r = ScalarIn[id];
+    else if (ViewMode == 1) r = rhoAir * PressureIn[id] / dt;
+    else if (ViewMode == 2) r = Div(id) * dt;
+    else if (ViewMode == 3) r = length(CellVel(id));
+    else if (ViewMode == 4) r = CellVel(id).y;
+    else if (ViewMode == 5) r = ThetaIn[id] - Bg[id.y].x;
+    else if (ViewMode == 6) r = 1000 * QvIn[id];
+    else if (ViewMode == 7) r = 1000 * QcIn[id];
+    else                    r = QvIn[id] / SatMixingRatio(ThetaIn[id] * Exner(Bg[id.y].z), Bg[id.y].z);
+    ViewOut[id] = r;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Statistics: one partial result per thread group (no float atomics needed), summed on the CPU.
+// StatsOut[4g]   = (sum density, max speed, max |div|, min density)
+// StatsOut[4g+1] = (max density, sum 0.5|u|^2, max |w|, max |view|)
+// StatsOut[4g+2] = (max w, -min w, max theta', -min theta')       (all reduced with max)
+// StatsOut[4g+3] = (sum rho*(q_v+q_c), sum rho*q_c, max q_c, max saturation ratio)
+// Needs VelIn, ScalarIn (density), ThetaIn, QvIn, QcIn, Bg and ViewIn bound.
+// ---------------------------------------------------------------------------------------------
+
+groupshared float4 gsA[512];
+groupshared float4 gsB[512];
+groupshared float4 gsC[512];
+groupshared float4 gsD[512];
+
+[numthreads(8, 8, 8)]
+void Stats(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    float4 a = float4(0, 0, 0, 1e30);
+    float4 b = float4(-1e30, 0, 0, 0);
+    float4 c = float4(-1e30, -1e30, -1e30, -1e30);
+    float4 e = float4(0, 0, 0, 0);
+    if (!Outside(id))
+    {
+        float d = ScalarIn[id];
+        float3 u = CellVel(id);
+        float tp = ThetaIn[id] - Bg[id.y].x;
+        a = float4(d, length(u), abs(Div(id)), d);
+        b = float4(d, 0.5 * dot(u, u), abs(u.y), abs(ViewIn[id]));
+        c = float4(u.y, -u.y, tp, -tp);
+        float4 bg = Bg[id.y];
+        float qv = QvIn[id], qc = QcIn[id];
+        e = float4(bg.w * (qv + qc), bg.w * qc, qc, qv / SatMixingRatio(ThetaIn[id] * Exner(bg.z), bg.z));
+    }
+    gsA[gi] = a;
+    gsB[gi] = b;
+    gsC[gi] = c;
+    gsD[gi] = e;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = 256; s > 0; s >>= 1)
+    {
+        if (gi < s)
+        {
+            float4 a2 = gsA[gi + s], b2 = gsB[gi + s];
+            a = float4(a.x + a2.x, max(a.y, a2.y), max(a.z, a2.z), min(a.w, a2.w));
+            b = float4(max(b.x, b2.x), b.y + b2.y, max(b.z, b2.z), max(b.w, b2.w));
+            c = max(c, gsC[gi + s]);
+            float4 e2 = gsD[gi + s];
+            e = float4(e.x + e2.x, e.y + e2.y, max(e.z, e2.z), max(e.w, e2.w));
+            gsD[gi] = e;
+            gsA[gi] = a;
+            gsB[gi] = b;
+            gsC[gi] = c;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0)
+    {
+        uint g = gid.x + Groups.x * (gid.y + Groups.y * gid.z);
+        StatsOut[4 * g]     = a;
+        StatsOut[4 * g + 1] = b;
+        StatsOut[4 * g + 2] = c;
+        StatsOut[4 * g + 3] = e;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rendering detail noise (Stage G), generated once. Tileable 3D noise in a NoiseSize^3 texture:
+//   R = Perlin-Worley (Perlin fBm "billowed" by Worley), G/B/A = inverted Worley at 4, 8, 16 cells per tile.
+// Only used by the renderer; it never touches the simulation fields.
+// ---------------------------------------------------------------------------------------------
+
+int NoiseSize;
+RWTexture3D<float4> NoiseOut;
+RWTexture3D<float4> WarpOut;   // rgb: three independent smooth fBm fields (0.5 = no displacement), for domain warping
+
+float3 Hash33(int3 c, int period)
+{
+    // wrap to 0..period-1 (c is never less than -period here), unsigned math only
+    uint3 p = (uint3)(c + period) % (uint)period;
+    return float3(Hash01(p, 11u), Hash01(p, 23u), Hash01(p, 37u));
+}
+
+// Inverted Worley (1 near feature points, 0 far away), tiling every 'cells' cells.
+float Worley(float3 x, int cells)
+{
+    float3 q = x * cells;
+    int3 c = (int3)floor(q);
+    float best = 1e9;
+    for (uint k = 0; k < 27; k++)
+    {
+        int3 o = int3(k % 3, (k / 3) % 3, k / 9) - 1;
+        float3 fp = (c + o) + Hash33(c + o, cells);
+        float3 d = fp - q;
+        best = min(best, dot(d, d));
+    }
+    return 1 - saturate(sqrt(best));
+}
+
+float Fade(float t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+
+// Gradient (Perlin) noise in about -1..1, tiling every 'period' cells.
+float Perlin(float3 x, int period)
+{
+    float3 q = x * period;
+    int3 c = (int3)floor(q);
+    float3 f = q - c;
+    float r = 0;
+    for (int k = 0; k < 8; k++)
+    {
+        int3 o = int3(k & 1, (k >> 1) & 1, k >> 2);
+        float3 g = normalize(Hash33(c + o, period) * 2 - 1 + 1e-4);
+        float v = dot(g, f - o);
+        float3 w = float3(o.x ? Fade(f.x) : 1 - Fade(f.x), o.y ? Fade(f.y) : 1 - Fade(f.y), o.z ? Fade(f.z) : 1 - Fade(f.z));
+        r += v * w.x * w.y * w.z;
+    }
+    return r * 1.5;
+}
+
+float4 ShapePerlinW, ShapeWorleyW;   // GenerateNoise: octave weights of the r channel (Horizon base shape)
+
+[numthreads(8, 8, 8)]
+void GenerateNoise(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint)NoiseSize)) return;
+    float3 x = (id + 0.5) / NoiseSize;
+    // octave weights (large 4 / mid 8 / small 16 cells per tile), set by CloudSim; normalized by their sums
+    float3 pwW = ShapePerlinW.xyz / max(dot(ShapePerlinW.xyz, 1), 1e-4);
+    float3 wwW = ShapeWorleyW.xyz / max(dot(ShapeWorleyW.xyz, 1), 1e-4);
+    float perlin = 0.5 + 0.5 * (Perlin(x, 4) * pwW.x + Perlin(x, 8) * pwW.y + Perlin(x, 16) * pwW.z);
+    float w4 = Worley(x, 4), w8 = Worley(x, 8), w16 = Worley(x, 16);
+    float wfbm = w4 * wwW.x + w8 * wwW.y + w16 * wwW.z;
+    float pw = saturate((perlin - (wfbm - 1)) / (1 - (wfbm - 1)) );   // remap(perlin, wfbm - 1, 1, 0, 1)
+    NoiseOut[id] = float4(pw, w4, w8, w16);
+
+    // Warp: Perlin fBm, three decorrelated copies (shifted within the tile, so still tileable)
+    float3 warp;
+    [unroll] for (int c = 0; c < 3; c++)
+    {
+        float3 xs = x + float3(0.31, 0.17, 0.53) * (c + 1);
+        warp[c] = (Perlin(xs, 2) * 0.57 + Perlin(xs, 4) * 0.29 + Perlin(xs, 8) * 0.14);
+    }
+    WarpOut[id] = float4(saturate(0.5 + 0.5 * warp), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Render-only distance field for empty-space skipping: Chebyshev distance (in cells, capped at Radius)
+// from every cell to the nearest cell with any cloud. Exact and separable: start with 0 at cloudy cells
+// and Radius elsewhere (DistSeed), then per axis  d(x) = min_k max(|k|, d(x + k e_axis))  (DistPass,
+// run for x, y, z). Moving a distance s along any ray changes it by at most s / cellSize.
+// ---------------------------------------------------------------------------------------------
+
+int FilterAxis;
+int Radius;
+Texture3D<float>   MaxIn;     // DistSeed: the rendered field; DistPass: the previous pass
+RWTexture3D<float> MaxOut;
+
+#pragma kernel DistSeed
+#pragma kernel DistPass
+#pragma kernel LocalMaxPass
+
+[numthreads(8, 8, 8)]
+void DistSeed(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    MaxOut[id] = MaxIn[id] > 0 ? 0 : (float)Radius;
+}
+
+[numthreads(8, 8, 8)]
+void DistPass(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    int3 d = FilterAxis == 0 ? DX : (FilterAxis == 1 ? DY : DZ);
+    float m = MaxIn[id];
+    for (int k = 1; k <= Radius; k++)
+    {
+        m = min(m, max((float)k, MaxIn[Cell((int3)id + k * d)]));
+        m = min(m, max((float)k, MaxIn[Cell((int3)id - k * d)]));
+    }
+    MaxOut[id] = m;
+}
+
+// Local maximum of the field along one axis within +-Radius cells; three passes give the max over a cube.
+// Render-only "cloud size" field: high in and near big, dense clouds, low around small thin ones.
+[numthreads(8, 8, 8)]
+void LocalMaxPass(uint3 id : SV_DispatchThreadID)
+{
+    if (Outside(id)) return;
+    int3 d = FilterAxis == 0 ? DX : (FilterAxis == 1 ? DY : DZ);
+    float m = MaxIn[id];
+    for (int k = 1; k <= Radius; k++)
+        m = max(m, max(MaxIn[Cell((int3)id + k * d)], MaxIn[Cell((int3)id - k * d)]));
+    MaxOut[id] = m;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Render-only diffusion lighting (multiple scattering using the cloud's geometry), on a coarse grid
+// (DiffSize = Size / DiffDown). Units: extinction 1/m, lengths m, fluence relative to the sun's irradiance.
+//   DiffDownsample: coarse extinction = mean of the fine cells.
+//   DiffSun:        transmittance toward the sun from each coarse cell.
+//   DiffSky:        fraction of sky light reaching each coarse cell: mean over 5 upward directions of
+//                   exp(-(1 - g) tau), the diffuse (reduced-extinction) transmittance through the cloud.
+//   DiffJacobi:     one Jacobi sweep of  -div(D grad phi) + sigma_a phi = sigma T_sun,
+//                   D = 1 / (3 sigma (1 - g)), phi = 0 in clear air, Marshak-type faces toward clear air.
+// ---------------------------------------------------------------------------------------------
+#pragma kernel DiffDownsample
+#pragma kernel DiffSun
+#pragma kernel DiffSky
+#pragma kernel DiffJacobi
+
+int3   DiffSize;          // coarse grid size
+int    DiffDown;       // fine cells per coarse cell (per axis)
+float  DiffCellM;          // coarse cell size (m)
+float3 SunDirGrid;     // unit vector toward the sun (grid axes = meter axes, cells are cubes)
+float  DiffG;          // asymmetry of the droplets for the reduced scattering coefficient (~0.85)
+float  DiffAlbedo;     // single-scattering albedo (~0.999)
+float  DiffVacuum;     // 1/m: below this a coarse cell counts as clear air (phi = 0)
+Texture3D<float>   DiffSigma;   // coarse extinction
+Texture3D<float>   DiffSunT;    // coarse sun transmittance
+Texture3D<float>   DiffIn;      // fluence, previous sweep
+RWTexture3D<float> DiffOut;
+
+int3 DiffWrap(int3 c)   // wrap (periodic x/z) or clamp, coarse grid
+{
+    int3 m = clamp(c, int3(0, 0, 0), DiffSize - 1);
+    if (Periodic != 0) { m.x = (c.x % DiffSize.x + DiffSize.x) % DiffSize.x; m.z = (c.z % DiffSize.z + DiffSize.z) % DiffSize.z; }
+    return m;
+}
+bool DiffInside(int3 c)
+{
+    bool inY = c.y >= 0 && c.y < DiffSize.y;
+    bool inXZ = Periodic != 0 || (c.x >= 0 && c.x < DiffSize.x && c.z >= 0 && c.z < DiffSize.z);
+    return inY && inXZ;
+}
+
+[numthreads(8, 8, 8)]
+void DiffDownsample(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)DiffSize)) return;
+    float s = 0; int n = 0;
+    for (int z = 0; z < DiffDown; z++) for (int y = 0; y < DiffDown; y++) for (int x = 0; x < DiffDown; x++)
+    {
+        int3 f = (int3)id * DiffDown + int3(x, y, z);
+        if (all(f < Size)) { s += MaxIn[f]; n++; }
+    }
+    DiffOut[id] = n > 0 ? s / n : 0;
+}
+
+[numthreads(8, 8, 8)]
+void DiffSun(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)DiffSize)) return;
+    float3 p = id + 0.5;
+    float tau = 0.5 * DiffSigma[id] * DiffCellM;          // half of the own cell
+    for (int k = 1; k < 512; k++)
+    {
+        int3 c = (int3)floor(p + SunDirGrid * k);
+        if (!DiffInside(c)) break;
+        tau += DiffSigma[DiffWrap(c)] * DiffCellM;
+        if (tau > 30) break;
+    }
+    DiffOut[id] = exp(-tau);
+}
+
+[numthreads(8, 8, 8)]
+void DiffSky(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)DiffSize)) return;
+    float3 p = id + 0.5;
+    const float3 dirs[5] = { float3(0, 1, 0), float3(0.7071, 0.7071, 0), float3(-0.7071, 0.7071, 0),
+                             float3(0, 0.7071, 0.7071), float3(0, 0.7071, -0.7071) };
+    float vis = 0;
+    [unroll] for (int d = 0; d < 5; d++)
+    {
+        float tau = 0.5 * DiffSigma[id] * DiffCellM;
+        for (int k = 1; k < 512; k++)
+        {
+            int3 c = (int3)floor(p + dirs[d] * k);
+            if (!DiffInside(c)) break;
+            tau += DiffSigma[DiffWrap(c)] * DiffCellM * length(dirs[d]);
+            if (tau * (1 - DiffG) > 10) break;
+        }
+        vis += exp(-(1 - DiffG) * tau);
+    }
+    DiffOut[id] = vis / 5;
+}
+
+[numthreads(8, 8, 8)]
+void DiffJacobi(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)DiffSize)) return;
+    float s = DiffSigma[id];
+    if (s < DiffVacuum) { DiffOut[id] = 0; return; }
+    float h = DiffCellM;
+    float Di = 1 / (3 * max(s * (1 - DiffG), 1e-6));
+    float sumC = 0, sumCP = 0;
+    int3 nb[6] = { int3(1,0,0), int3(-1,0,0), int3(0,1,0), int3(0,-1,0), int3(0,0,1), int3(0,0,-1) };
+    [unroll] for (int k = 0; k < 6; k++)
+    {
+        int3 c = (int3)id + nb[k];
+        float sn = DiffInside(c) ? DiffSigma[DiffWrap(c)] : 0;
+        if (sn < DiffVacuum)
+        {
+            sumC += Di * h / (0.5 * h + 2 * Di);         // to clear air: extrapolated zero 2D beyond the face
+        }
+        else
+        {
+            float Dn = 1 / (3 * max(sn * (1 - DiffG), 1e-6));
+            float cf = 2 * Di * Dn / (Di + Dn);           // harmonic mean
+            sumC += cf;
+            sumCP += cf * DiffIn[DiffWrap(c)];
+        }
+    }
+    float q = s * DiffSunT[id];                           // light scattered out of the sun beam
+    float sa = s * (1 - DiffAlbedo);
+    DiffOut[id] = (sumCP + q * h * h) / (sumC + sa * h * h);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Render-only cloud size field, on a coarse grid (ScaleSize = Size / ScaleDown), for size-aware lobe noise:
+//   ScaleSeed: coarse cells with cloud (mean extinction > ScaleThreshold) start at ScaleRadius, clear air at 0.
+//   ScalePass, mode 0 (x3 axes): Chebyshev distance to clear air = interior depth D (coarse cells, capped).
+//              mode 1 (x3): spread the deepest depth over the cloud body: L(x) = max_y D(y) - ScaleSlope |x - y|,
+//                           along axis paths that stay inside cloud (D > 0); a path through clear air is cut, so a
+//                           tower's edge gets the tower's scale (not 0) and a small cloud beside it keeps its own.
+//              mode 2 (x3): box average (removes the steps of the integer distances).
+//              mode 3:      temporal relaxation toward the new value (lobes don't jump as the cloud evolves).
+// ---------------------------------------------------------------------------------------------
+#pragma kernel ScaleSeed
+#pragma kernel ScalePass
+
+int3   ScaleSize;
+int    ScaleDown, ScaleMode, ScaleRadius, ScaleAxis;
+float  ScaleThreshold, ScaleSlope, ScaleRelax;
+Texture3D<float>   ScaleIn, ScalePrev, ScaleD;
+RWTexture3D<float> ScaleOut;
+
+int3 ScaleCell(int3 c)
+{
+    int3 m = clamp(c, int3(0, 0, 0), ScaleSize - 1);
+    if (Periodic != 0) { m.x = (c.x % ScaleSize.x + ScaleSize.x) % ScaleSize.x; m.z = (c.z % ScaleSize.z + ScaleSize.z) % ScaleSize.z; }
+    return m;
+}
+
+[numthreads(8, 8, 8)]
+void ScaleSeed(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)ScaleSize)) return;
+    // cloud if any of its simulation cells is (the mean missed the half-filled cells along every edge, which made big
+    // clouds measure a cell thinner than they are)
+    float s = 0;
+    for (int z = 0; z < ScaleDown; z++) for (int y = 0; y < ScaleDown; y++) for (int x = 0; x < ScaleDown; x++)
+    {
+        int3 f = (int3)id * ScaleDown + int3(x, y, z);
+        if (all(f < Size)) s = max(s, MaxIn[f]);
+    }
+    ScaleOut[id] = s > ScaleThreshold ? (float)ScaleRadius : 0;
+}
+
+[numthreads(8, 8, 8)]
+void ScalePass(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)ScaleSize)) return;
+    float v = ScaleIn[id];
+    if (ScaleMode == 3) { ScaleOut[id] = lerp(ScalePrev[id], v, ScaleRelax); return; }
+    int3 d = ScaleAxis == 0 ? int3(1, 0, 0) : (ScaleAxis == 1 ? int3(0, 1, 0) : int3(0, 0, 1));
+    float m = v, sum = v;
+    // mode 1: the path from this cell stays within one cloud: it may cross a single clear-air cell (the cloud's ragged
+    // edge, and the clear-air shell just outside it, where the ray march still samples the noise and the visible
+    // surface lies), but two clear cells in a row end it, so a separate small cloud keeps its own size.
+    int gapA = ScaleD[id] > 0 ? 0 : 1, gapB = gapA;
+    for (int k = 1; k <= ScaleRadius; k++)
+    {
+        int3 ca = ScaleCell((int3)id + k * d), cb = ScaleCell((int3)id - k * d);
+        float a = ScaleIn[ca], b = ScaleIn[cb];
+        if (ScaleMode == 0) m = min(m, min(max((float)k, a), max((float)k, b)));
+        else if (ScaleMode == 1)
+        {
+            gapA = gapA > 1 ? 2 : (ScaleD[ca] > 0 ? 0 : gapA + 1);
+            gapB = gapB > 1 ? 2 : (ScaleD[cb] > 0 ? 0 : gapB + 1);
+            if (gapA < 2) m = max(m, a - ScaleSlope * k);
+            if (gapB < 2) m = max(m, b - ScaleSlope * k);
+        }
+        else sum += a + b;
+    }
+    ScaleOut[id] = ScaleMode == 2 ? sum / (2 * ScaleRadius + 1) : m;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Render-only bake of the per-sample Horizon-mode inputs that are smooth at the grid scale, once per frame, so the
+// ray march reads them (one fetch) instead of computing them at every sample (VolumeRaymarch.shader):
+//   r: top weight (up-facing x not sinking) -- picks the lobe scale (top Shape Scale / bottom)
+//   g: extinction (1/m) 1.5 cells below -- the shader finishes the detail layer's "substantial cloud" test with it
+//   b, a: lobe noise at the top / bottom Shape Scale, carried by the wind (two phases), de-tiled, normalized 0..1
+//         Size-aware (SizeOn): a ladder of SizeLevels noise scales 3x apart (Shape Scale x 1, 3, 9), weighted by the
+//         local cloud scale L from the size field: small clouds get only the base scale (unchanged), big ones
+//         large towers carrying smaller billows. Big clouds are also carved by depth (Horizon's coverage remap with
+//         coverage = interior depth / (BakeCarve x lobe size)): at the edge only the noise peaks survive (gaps
+//         between towers), deeper than ~a lobe size everything is kept. The density-based coverage in the shader
+//         only reaches the thin low-density shell (~150-300 m), too shallow for km-sized towers.
+//         (blended by the top weight in the shader, so light samples can use the shaded point's weight as before)
+// Bake grid = simulation grid x BakeRes (cell centres). Same formulas as the shader's TopWeight / ShapeNoise.
+// ---------------------------------------------------------------------------------------------
+#pragma kernel BakeShape
+
+int3   BakeSize;
+Texture3D<float>    BakeSigma;     // rendered extinction (1/m), simulation grid
+Texture3D<float4>   BakeVel;       // wind (m/s)
+Texture3D<float4>   BakeNoise;     // noise texture (r = Horizon base shape)
+StructuredBuffer<float4> BakeWind; // per cell row: horizontal-mean wind (noise transport)
+RWTexture3D<float4> BakeOut;
+float3 BakeDomainM;                // domain size (m)
+float  BakeNoiseTime, BakeNoisePeriod, BakeShapeScale, BakeShapeScaleBottom, BakeShapeLo, BakeShapeHi, BakeDetile, BakeSink;
+Texture3D<float>    BakeScale;     // size field: local cloud scale L (coarse cells)
+Texture3D<float>    BakeDepth;     // size field: interior depth D (coarse cells)
+Texture3D<float>    BakeOcc;       // distance to the nearest cloud cell (simulation cells), for skipping clear air
+float  BakeSizeOn, BakeLadderGain, BakeScaleCellM, BakeSizeRef, BakeSizeLevels, BakeCarve, BakeOccMargin;
+float4 BakeDetailW;   // xyz: Worley octave weights (as the shader's billow noise)
+float  BakeBillowLo, BakeBillowHi, BakeBillows;
+SamplerState bake_linear_clamp_sampler, bake_linear_repeat_sampler;
+static const float3x3 kBakeRot = float3x3(0.708791, -0.136696, 0.692047, 0.427299, 0.863780, -0.267021, -0.561276, 0.484973, 0.670649);
+
+float BakeShapeValue(float3 x)
+{
+    float a = BakeNoise.SampleLevel(bake_linear_repeat_sampler, x, 0).r;
+    if (BakeDetile < 0.5) return a;
+    float b = BakeNoise.SampleLevel(bake_linear_repeat_sampler, mul(kBakeRot, x) * 0.6123 + 0.213, 0).r;
+    float mid = 0.5 * (BakeShapeLo + BakeShapeHi);
+    return mid + (0.5 * (a + b) - mid) * 1.4142;
+}
+float BakeShapeAt(float3 m, float3 u, float scale, float ph0, float ph1)
+{
+    float a = BakeShapeValue((m - u * ph0 * BakeNoisePeriod) / scale + 0.11);
+    float b = BakeShapeValue((m - u * ph1 * BakeNoisePeriod) / scale + 0.53);
+    return lerp(b, a, 1 - abs(2 * ph0 - 1));
+}
+
+// Billow noise (Worley fBm, the shader's DetailNoise y) at scale 'scale' m, carried by the wind like the lobes. 0..1.
+float BakeBillowValue(float3 x)
+{
+    float a = dot(BakeNoise.SampleLevel(bake_linear_repeat_sampler, x, 0).gba, BakeDetailW.xyz);
+    if (BakeDetile > 0.5)
+    {
+        float b = dot(BakeNoise.SampleLevel(bake_linear_repeat_sampler, mul(kBakeRot, x) * 0.6123 + 0.213, 0).gba, BakeDetailW.xyz);
+        float mid = 0.5 * (BakeBillowLo + BakeBillowHi);
+        a = mid + (0.5 * (a + b) - mid) * 1.4142;
+    }
+    return smoothstep(0, 1, (a - BakeBillowLo) / max(BakeBillowHi - BakeBillowLo, 1e-4));
+}
+float BakeBillowAt(float3 m, float3 u, float scale, float ph0, float ph1)
+{
+    float a = BakeBillowValue((m - u * ph0 * BakeNoisePeriod) / scale + 0.29);
+    float b = BakeBillowValue((m - u * ph1 * BakeNoisePeriod) / scale + 0.71);
+    return lerp(b, a, 1 - abs(2 * ph0 - 1));
+}
+
+// Raw lobe noise -> 0..1, as the shader's ShapeNoise does
+float BakeNorm(float v) { return smoothstep(0, 1, (v - BakeShapeLo) / max(BakeShapeHi - BakeShapeLo, 1e-4)); }
+
+// Lobe noise with the scale ladder: level = how many factors of 3 the cloud is bigger than the reference.
+// Octave i (scale base * 3^i) fades in as level passes i - 1 -> i; the largest active octave has amplitude 1,
+// each smaller one BakeLadderGain x. The sum keeps one octave's spread (divided by the root of the summed squared weights),
+// so at level 0 it is exactly the single base-scale value.
+float BakeLadder(float3 m, float3 u, float baseScale, float level, float ph0, float ph1)
+{
+    float mid = 0.5 * (BakeShapeLo + BakeShapeHi);
+    float sum = 0, w2 = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        if (i >= BakeSizeLevels) break;
+        float act = i == 0 ? 1 : saturate(level - i + 1);
+        if (act <= 0) break;
+        float w = act * pow(max(BakeLadderGain, 1e-3), max(level - i, 0));   // pow(0, 0) is NaN on GPUs
+        sum += w * (BakeShapeAt(m, u, baseScale * pow(3, i), ph0, ph1) - mid);
+        w2 += w * w;
+    }
+    return mid + sum / sqrt(max(w2, 1e-6));
+}
+
+// Smooth (cubic B-spline) extinction at texture coordinates uvw, from 8 linear fetches: same filter as the shader's
+// SigmaSmooth, which the top weight was tuned with (linear reads gave a visibly different weight).
+float BakeSigmaCubic(float3 uvw)
+{
+    float3 sz = Size;
+    float3 coord = uvw * sz - 0.5;
+    float3 i = floor(coord), f = coord - i, f2 = f * f, f3 = f2 * f;
+    float3 w0 = (1 - 3 * f + 3 * f2 - f3) / 6, w1 = (4 - 6 * f2 + 3 * f3) / 6;
+    float3 w2 = (1 + 3 * f + 3 * f2 - 3 * f3) / 6, w3 = f3 / 6;
+    float3 g0 = w0 + w1, g1 = w2 + w3;
+    float3 h0 = (i - 0.5 + w1 / g0) / sz, h1 = (i + 1.5 + w3 / g1) / sz;
+    float r = 0;
+    [unroll] for (int k = 0; k < 8; k++)
+    {
+        float3 s3 = float3(k & 1, (k >> 1) & 1, k >> 2);
+        float3 g = lerp(g0, g1, s3);
+        r += g.x * g.y * g.z * BakeSigma.SampleLevel(bake_linear_clamp_sampler, lerp(h0, h1, s3), 0);
+    }
+    return max(r, 0);
+}
+
+[numthreads(8, 8, 8)]
+void BakeShape(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)BakeSize)) return;
+    float3 uvw = (id + 0.5) / BakeSize;                   // texture coordinates (0..1), as p + 0.5 in the shader
+    // far from any cloud the values are never used
+    if (BakeOcc.SampleLevel(bake_linear_clamp_sampler, uvw, 0) > BakeOccMargin) { BakeOut[id] = float4(0, 0, 1, 1); return; }
+    // top weight (shader TopWeight): density 1.5 sim cells above / below, vertical wind here and 2 cells below
+    float dy = 1.5 / Size.y;
+    float sa = BakeSigmaCubic(uvw + float3(0, dy, 0));
+    float sb = BakeSigmaCubic(uvw - float3(0, dy, 0));
+    if (uvw.y + dy > 1) sa = 0;
+    if (uvw.y - dy < 0) sb = 0;
+    float upFacing = smoothstep(0, 1, 0.5 + (sb - sa) / (sa + sb + 1e-5));
+    float w = BakeVel.SampleLevel(bake_linear_clamp_sampler, uvw, 0).y;
+    float wb = BakeVel.SampleLevel(bake_linear_clamp_sampler, uvw - float3(0, 2.0 / Size.y, 0), 0).y;
+    float tw = upFacing * smoothstep(-2 * BakeSink, -BakeSink, max(w, wb));
+    // lobe noise (shader ShapeNoise)
+    float3 m = uvw * BakeDomainM;
+    float fy = clamp(uvw.y * Size.y - 0.5, 0, Size.y - 1);
+    int y0 = (int)fy, y1 = min(y0 + 1, Size.y - 1);
+    float2 mw = lerp(BakeWind[y0].xy, BakeWind[y1].xy, fy - y0);
+    float3 u = float3(mw.x, 0, mw.y);
+    float ph0 = frac(BakeNoiseTime / BakeNoisePeriod), ph1 = frac(ph0 + 0.5);
+    float top, bottom;
+    if (BakeSizeOn > 0.5)
+    {
+        float L = BakeScale.SampleLevel(bake_linear_clamp_sampler, uvw, 0) * BakeScaleCellM;
+        float level = clamp(log(max(L, 1) / BakeSizeRef) / log(3), 0, BakeSizeLevels - 1);
+        top = BakeLadder(m, u, BakeShapeScale, level, ph0, ph1);
+        bottom = BakeLadder(m, u, BakeShapeScaleBottom, level, ph0, ph1);
+        top = BakeNorm(top); bottom = BakeNorm(bottom);
+        float D = BakeDepth.SampleLevel(bake_linear_clamp_sampler, uvw, 0) * BakeScaleCellM;
+        float lobe = 0.25 * BakeShapeScale * pow(3, level);   // feature size of the largest active octave (m)
+        float cov = saturate(D / (BakeCarve * lobe)), k = saturate(level);
+        top = lerp(top, saturate((top - (1 - cov)) / max(cov, 1e-3)), k);
+        bottom = lerp(bottom, saturate((bottom - (1 - cov)) / max(cov, 1e-3)), k);
+        // Billows: each lobe size smaller than the largest active one erodes the surface (HZD-style remap, only
+        // removes cloud) with round Worley cells. Where the large lobes rise steeply this cuts a shallow layer,
+        // so the towers keep their shape and carry smaller rounded bulges, and those carry the fine detail (shader).
+        [loop] for (int i = 0; i < 3; i++)
+        {
+            float act = saturate(level - i);
+            if (act <= 0) break;
+            float e = BakeBillows * act * BakeBillowAt(m, u, BakeShapeScale * pow(3, i) * 0.5, ph0, ph1);
+            top = saturate((top - e) / (1 - e));
+            bottom = saturate((bottom - e) / (1 - e));
+        }
+    }
+    else
+    {
+        top = BakeNorm(BakeShapeAt(m, u, BakeShapeScale, ph0, ph1));
+        bottom = BakeNorm(BakeShapeAt(m, u, BakeShapeScaleBottom, ph0, ph1));
+    }
+    BakeOut[id] = float4(tw, sb, top, bottom);
+}
